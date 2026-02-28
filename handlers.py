@@ -1,11 +1,15 @@
 import logging
 from telegram import Update
-from telegram.ext import ContextTypes
+from telegram.ext import ContextTypes, ConversationHandler
 from store import DataStore
 from config import MAX_WALLETS
 
 logger = logging.getLogger(__name__)
 store = DataStore()
+
+# Conversation states
+WAITING_FOR_ADDRESS = 1
+WAITING_FOR_NAME = 2
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -14,59 +18,111 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👁 *Solana Multi-Wallet Buy Tracker*\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "Track 70+ wallets and get alerted when multiple wallets buy the same token.\n\n"
-        "*Commands:*\n"
-        "/addwallet `<address> <name>` — Add a wallet\n"
-        "/removewallet `<address>` — Remove a wallet\n"
-        "/wallets — List all tracked wallets\n"
-        "/threshold `<number>` — Set min wallets to trigger alert (default: 2)\n"
-        "/status — Show tracker status\n"
-        "/help — Show this message\n\n"
+        "Tap / to see all available commands.\n\n"
         "Add at least *70 wallets* to start tracking."
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-async def add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    store.add_chat_id(chat_id)
+# ─────────────────────────────────────────────
+# ADD WALLET — Conversational 3-step flow
+# ─────────────────────────────────────────────
 
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "❌ Usage: `/addwallet <address> <name>`\n"
-            "Example: `/addwallet 7xKX...abc3 Whale1`",
-            parse_mode="Markdown"
-        )
-        return
+async def add_wallet_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1 — /addwallet tapped, ask for address."""
+    store.add_chat_id(update.effective_chat.id)
+    await update.message.reply_text(
+        "👛 *Add a Wallet — Step 1 of 2*\n\n"
+        "Send me the *Solana wallet address* you want to track:",
+        parse_mode="Markdown"
+    )
+    return WAITING_FOR_ADDRESS
 
-    address = context.args[0].strip()
-    name = " ".join(context.args[1:]).strip()
+async def add_wallet_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2 — Validate address, ask for name."""
+    address = update.message.text.strip()
 
-    # Basic Solana address validation
     if len(address) < 32 or len(address) > 44:
-        await update.message.reply_text("❌ Invalid Solana address. Must be 32-44 characters.")
-        return
-
-    current_count = store.get_wallet_count()
-    if current_count >= MAX_WALLETS:
-        await update.message.reply_text(f"❌ Maximum wallet limit ({MAX_WALLETS}) reached.")
-        return
+        await update.message.reply_text(
+            "❌ That doesn't look like a valid Solana address.\n"
+            "It should be 32-44 characters long.\n\n"
+            "Try again or type /cancel to stop."
+        )
+        return WAITING_FOR_ADDRESS
 
     wallets = store.get_wallets()
     if address in wallets:
-        await update.message.reply_text(f"⚠️ Wallet already tracked as *{wallets[address]['name']}*", parse_mode="Markdown")
-        return
+        existing_name = wallets[address].get("name", "Unknown")
+        await update.message.reply_text(
+            f"⚠️ Already tracking this wallet as *{existing_name}*.\n\n"
+            "Send a different address or type /cancel.",
+            parse_mode="Markdown"
+        )
+        return WAITING_FOR_ADDRESS
+
+    if store.get_wallet_count() >= MAX_WALLETS:
+        await update.message.reply_text(f"❌ Maximum wallet limit ({MAX_WALLETS}) reached.")
+        return ConversationHandler.END
+
+    context.user_data["pending_address"] = address
+
+    await update.message.reply_text(
+        f"✅ *Address received!*\n`{address}`\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "*Step 2 of 2* — Give this wallet a name so you recognise it in alerts.\n\n"
+        "Examples: _Whale1_, _Alpha Caller_, _Dev Wallet_, _KOL 5_\n\n"
+        "What do you want to call this wallet?",
+        parse_mode="Markdown"
+    )
+    return WAITING_FOR_NAME
+
+async def add_wallet_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 3 — Save wallet with name."""
+    name = update.message.text.strip()
+    address = context.user_data.get("pending_address")
+    chat_id = update.effective_chat.id
+
+    if not address:
+        await update.message.reply_text("❌ Something went wrong. Type /addwallet and try again.")
+        return ConversationHandler.END
+
+    if len(name) > 30:
+        await update.message.reply_text("❌ Name too long. Keep it under 30 characters and try again:")
+        return WAITING_FOR_NAME
 
     store.add_wallet(address, name, chat_id)
     new_count = store.get_wallet_count()
-    
-    msg = f"✅ Added wallet *{name}*\n`{address}`\n\n📊 Total wallets: *{new_count}*"
+    context.user_data.clear()
+
+    msg = (
+        f"🎉 *Wallet added!*\n\n"
+        f"👛 Name: *{name}*\n"
+        f"📋 Address: `{address}`\n\n"
+        f"📊 Total wallets tracked: *{new_count}*"
+    )
     if new_count < 70:
-        msg += f"\n⚠️ Need {70 - new_count} more wallets to reach minimum (70)."
-    
+        msg += f"\n⚠️ Need *{70 - new_count}* more wallets to reach the minimum (70)."
+    else:
+        msg += f"\n✅ Tracking {new_count} wallets — alerts are active!"
+
     await update.message.reply_text(msg, parse_mode="Markdown")
+    return ConversationHandler.END
+
+async def add_wallet_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Cancelled. No wallet was added.")
+    return ConversationHandler.END
+
+# ─────────────────────────────────────────────
+# OTHER COMMANDS
+# ─────────────────────────────────────────────
 
 async def remove_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ Usage: `/removewallet <address>`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "❌ Usage: `/removewallet <address>`\n"
+            "Example: `/removewallet 7xKX...abc3`",
+            parse_mode="Markdown"
+        )
         return
 
     address = context.args[0].strip()
@@ -76,26 +132,24 @@ async def remove_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if store.remove_wallet(address):
         await update.message.reply_text(
-            f"🗑 Removed wallet *{name}*\n📊 Total wallets: *{store.get_wallet_count()}*",
+            f"🗑 Removed *{name}*\n📊 Total wallets: *{store.get_wallet_count()}*",
             parse_mode="Markdown"
         )
     else:
-        await update.message.reply_text("❌ Wallet not found.")
+        await update.message.reply_text("❌ Wallet not found. Check the address and try again.")
 
 async def list_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wallets = store.get_wallets()
     if not wallets:
-        await update.message.reply_text("📭 No wallets tracked yet. Use /addwallet to add some.")
+        await update.message.reply_text("📭 No wallets tracked yet. Use /addwallet to add one.")
         return
 
     count = len(wallets)
     lines = [f"👛 *Tracked Wallets ({count}):*\n"]
-    
     for i, (addr, info) in enumerate(wallets.items(), 1):
         name = info.get("name", "Unnamed")
         lines.append(f"{i}. *{name}*\n   `{addr}`")
 
-    # Split into chunks if too long
     full_msg = "\n".join(lines)
     if len(full_msg) > 4000:
         chunks = []
@@ -117,7 +171,8 @@ async def set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current = store.get_threshold()
         await update.message.reply_text(
             f"📊 Current threshold: *{current}* wallets\n"
-            "Use `/threshold <number>` to change it.",
+            "Use `/threshold <number>` to change it.\n"
+            "Example: `/threshold 3`",
             parse_mode="Markdown"
         )
         return
@@ -129,14 +184,18 @@ async def set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if value > store.get_wallet_count():
             await update.message.reply_text(
-                f"⚠️ Threshold ({value}) is higher than your wallet count ({store.get_wallet_count()}). "
-                "You'll never get alerts. Set a lower value."
+                f"⚠️ Threshold ({value}) is higher than your wallet count ({store.get_wallet_count()}).\n"
+                "You'll never get alerts at this setting. Use a lower number."
             )
             return
         store.set_threshold(value)
-        await update.message.reply_text(f"✅ Alert threshold set to *{value}* wallets.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"✅ Alert threshold set to *{value}* wallets.\n"
+            f"You'll be alerted when {value}+ wallets buy the same token.",
+            parse_mode="Markdown"
+        )
     except ValueError:
-        await update.message.reply_text("❌ Please enter a valid number.")
+        await update.message.reply_text("❌ Please enter a valid number. Example: `/threshold 3`", parse_mode="Markdown")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tracker = context.bot_data.get('tracker')
@@ -157,9 +216,19 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
+    msg = (
+        "👁 *Solana Multi-Wallet Buy Tracker*\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "*Commands:*\n"
+        "/addwallet — Add a wallet to track\n"
+        "/removewallet — Remove a tracked wallet\n"
+        "/wallets — List all tracked wallets\n"
+        "/threshold — Set how many wallets must buy to trigger alert\n"
+        "/status — Show tracker status\n"
+        "/help — Show this message\n\n"
+        "Tap / at any time to see the full command menu."
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Use /help to see available commands."
-    )
+    await update.message.reply_text("Tap / to see all available commands.")
