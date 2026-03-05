@@ -2,7 +2,11 @@ import asyncio
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
-from config import POLL_INTERVAL
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from config import (
+    NORMAL_POLL_INTERVAL, ECO_POLL_INTERVAL,
+    NORMAL_TX_FETCH, ECO_TX_FETCH
+)
 from store import DataStore
 from helius import HeliusClient
 
@@ -10,23 +14,20 @@ logger = logging.getLogger(__name__)
 
 class WalletTracker:
     def __init__(self, app):
-        self.app = app
-        self.store = DataStore()
-        self.helius = HeliusClient()
-        self.running = False
-
-        # Last seen signatures per wallet
+        self.app         = app
+        self.store       = DataStore()
+        self.helius      = HeliusClient()
+        self.running     = False
         self.last_signatures = {}
-
-        # token_mint -> { wallet_address -> {sig, timestamp} }
-        self.token_buys = defaultdict(dict)
-
-        # Time window to group buys
+        self.token_buys  = defaultdict(dict)   # token_mint -> {wallet: {sig, ts, sol_spent}}
         self.time_window = timedelta(minutes=10)
-
-        # Sent alerts: per chat — set of frozensets
-        # chat_id -> set of frozenset(wallet_addresses)
         self.sent_alerts = defaultdict(set)
+
+    def _get_poll_interval(self):
+        return ECO_POLL_INTERVAL if self.store.any_eco_mode() else NORMAL_POLL_INTERVAL
+
+    def _get_tx_limit(self):
+        return ECO_TX_FETCH if self.store.any_eco_mode() else NORMAL_TX_FETCH
 
     async def start_tracking(self):
         self.running = True
@@ -34,96 +35,69 @@ class WalletTracker:
         logger.info("Wallet tracker started.")
         while self.running:
             await self.poll_all_wallets()
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(self._get_poll_interval())
 
     async def stop(self):
         self.running = False
         await self.helius.close()
 
     async def poll_all_wallets(self):
-        # Poll every unique address across all chats
-        all_addresses = self.store.get_all_addresses()
-        if not all_addresses:
+        addresses = list(self.store.get_all_addresses())
+        if not addresses:
             return
-
-        addresses = list(all_addresses)
-        batch_size = 10
-
-        for i in range(0, len(addresses), batch_size):
-            batch = addresses[i:i + batch_size]
-            tasks = [self.process_wallet(addr) for addr in batch]
-            await asyncio.gather(*tasks, return_exceptions=True)
+        for i in range(0, len(addresses), 10):
+            batch = addresses[i:i+10]
+            await asyncio.gather(*[self.process_wallet(a, self._get_tx_limit()) for a in batch],
+                                  return_exceptions=True)
             await asyncio.sleep(1)
-
         await self.check_alerts()
 
-    async def process_wallet(self, wallet_address: str):
+    async def process_wallet(self, wallet_address: str, tx_limit: int = 10):
         try:
-            txs = await self.helius.get_wallet_transactions(wallet_address)
+            txs = await self.helius.get_wallet_transactions(wallet_address, limit=tx_limit)
             if not txs:
                 return
-
+            self.store.add_credits_used(1)
             seen = self.last_signatures.get(wallet_address, set())
-
             for tx in txs:
-                sig = tx.get("signature", "")
+                sig  = tx.get("signature", "")
                 if sig in seen:
                     continue
-
                 swap = self.helius.parse_swap_transaction(tx)
                 if not swap:
                     continue
-
-                token_mint = swap["token_mint"]
-                timestamp = swap["timestamp"]
-
-                logger.info(f"[BUY] {wallet_address[:8]}... bought {token_mint[:8]}...")
-
-                self.token_buys[token_mint][wallet_address] = {
+                mint = swap["token_mint"]
+                logger.info(f"[BUY] {wallet_address[:8]}... â {mint[:8]}...")
+                self.token_buys[mint][wallet_address] = {
                     "signature": sig,
-                    "timestamp": timestamp,
+                    "timestamp": swap["timestamp"],
+                    "sol_spent": swap.get("sol_spent", 0),
                     "wallet_address": wallet_address
                 }
                 seen.add(sig)
-
             self.last_signatures[wallet_address] = set(list(seen)[-50:])
-
         except Exception as e:
-            logger.error(f"Error processing wallet {wallet_address}: {e}")
+            logger.error(f"process_wallet {wallet_address[:8]}: {e}")
 
     async def check_alerts(self):
         now = datetime.utcnow()
-
         for token_mint, buyers in list(self.token_buys.items()):
-            # Filter to buys within the time window
-            recent_buyers = {
+            recent = {
                 addr: info for addr, info in buyers.items()
                 if datetime.utcfromtimestamp(info["timestamp"]) > now - self.time_window
             }
-
-            if not recent_buyers:
+            if not recent:
                 continue
-
-            # For each chat, check if enough of THEIR wallets bought this token
             for chat_id_str, chat_data in self.store.data["chats"].items():
-                chat_id = int(chat_id_str)
+                chat_id      = int(chat_id_str)
                 chat_wallets = chat_data.get("wallets", {})
-                threshold = chat_data.get("threshold", 2)
-
-                # Which recent buyers belong to THIS chat
-                chat_buyers = {
-                    addr: info for addr, info in recent_buyers.items()
-                    if addr in chat_wallets
-                }
-
+                threshold    = chat_data.get("threshold", 2)
+                chat_buyers  = {a: i for a, i in recent.items() if a in chat_wallets}
                 if len(chat_buyers) < threshold:
                     continue
-
-                # Check if we already sent this alert to this chat
                 alert_key = frozenset(chat_buyers.keys())
                 if alert_key in self.sent_alerts[chat_id]:
                     continue
-
                 self.sent_alerts[chat_id].add(alert_key)
                 await self.send_alert(chat_id, token_mint, chat_buyers, chat_wallets)
 
@@ -131,48 +105,93 @@ class WalletTracker:
                           buyers: dict, chat_wallets: dict):
         market_data = await self.helius.get_market_cap(token_mint)
 
-        ticker = market_data.get("ticker", "UNKNOWN")
-        token_name = market_data.get("name", "Unknown Token")
+        ticker     = market_data.get("ticker", "???")
+        token_name = market_data.get("name", "Unknown")
         market_cap = market_data.get("market_cap", 0)
-        price = market_data.get("price_usd", "0")
-        dex = market_data.get("dex", "").upper()
+        price      = market_data.get("price_usd", "0")
+        dex        = market_data.get("dex", "").lower()
+        pair_addr  = market_data.get("pair_address", "")
 
         def fmt_mc(mc):
-            if not mc:
-                return "Unknown"
+            if not mc: return "â"
             mc = float(mc)
-            if mc >= 1_000_000:
-                return f"${mc/1_000_000:.2f}M"
-            elif mc >= 1000:
-                return f"${mc/1000:.1f}K"
-            return f"${mc:.2f}"
+            if mc >= 1_000_000: return f"${mc/1_000_000:.2f}M"
+            if mc >= 1_000:     return f"${mc/1_000:.1f}K"
+            return f"${mc:.0f}"
 
+        def fmt_sol(lamports):
+            if not lamports: return ""
+            sol = lamports / 1e9
+            if sol > 0.001: return f" ({sol:.2f} SOL)"
+            return ""
+
+        # How many seconds ago was the first buy
+        timestamps  = [info["timestamp"] for info in buyers.values()]
+        earliest    = min(timestamps)
+        seen_secs   = int(datetime.utcnow().timestamp() - earliest)
+        seen_str    = f"{seen_secs}s" if seen_secs < 60 else f"{seen_secs//60}m{seen_secs%60}s"
+
+        # Build wallet lines â Name swapped X SOL for Y TOKEN
         wallet_lines = []
-        for addr in buyers:
-            name = chat_wallets.get(addr, {}).get("name", addr[:8] + "...")
-            wallet_lines.append(f"  • {name}")
+        for addr, info in buyers.items():
+            name     = chat_wallets.get(addr, {}).get("name", addr[:8] + "...")
+            sol_note = fmt_sol(info.get("sol_spent", 0))
+            wallet_lines.append(f"ð *{name}*{sol_note}")
 
-        message = (
-            f"🚨 *MULTI-WALLET BUY ALERT* 🚨\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"*{len(buyers)} wallets* bought the same token!\n\n"
-            f"🪙 *Token:* {token_name} (${ticker})\n"
-            f"📋 *CA:* `{token_mint}`\n"
-            f"💰 *Market Cap:* {fmt_mc(market_cap)}\n"
-            f"💵 *Price:* ${price}\n"
-            f"🏦 *DEX:* {dex if dex else 'Solana DEX'}\n\n"
-            f"👛 *Wallets that bought:*\n"
+        # Dex label
+        dex_label = {
+            "raydium":    "Raydium",
+            "jupiter":    "Jupiter",
+            "orca":       "Orca",
+            "pumpfun":    "Pump.fun",
+            "pump-fun":   "Pump.fun",
+        }.get(dex, dex.upper() if dex else "Solana DEX")
+
+        eco_tag = "  ð" if self.store.any_eco_mode() else ""
+
+        # ââ Alert message â Ray Gold style ââ
+        text = (
+            f"ð¨  *{len(buyers)} WALLETS BOUGHT*{eco_tag}\n"
+            f"\n"
             + "\n".join(wallet_lines) +
-            f"\n━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+            f"\n\n"
+            f"ð  *#{ticker}*  |  MC: *{fmt_mc(market_cap)}*  |  Seen: *{seen_str}*\n"
+            f"`{token_mint}`\n"
+            f"\n"
+            f"ðµ Price  *${price}*\n"
+            f"ð¦ DEX    *{dex_label}*"
         )
+
+        # ââ Quick-buy buttons â links to trading bots ââ
+        trojan_url = f"https://t.me/solana_trojanbot?start=r-buy_{token_mint}"
+        gmgn_url   = f"https://gmgn.ai/sol/token/{token_mint}"
+        ds_url     = f"https://dexscreener.com/solana/{token_mint}"
+        pump_url   = f"https://pump.fun/{token_mint}"
+        bullx_url  = f"https://bullx.io/terminal?chainId=1399811149&address={token_mint}"
+        axiom_url  = f"https://axiom.trade/meme/{token_mint}"
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(f"ð´ Trojan: #{ticker}",  url=trojan_url),
+                InlineKeyboardButton(f"ð¦ GMGN: #{ticker}",    url=gmgn_url),
+            ],
+            [
+                InlineKeyboardButton(f"ð Chart",              url=ds_url),
+                InlineKeyboardButton(f"â¡ BullX: #{ticker}",   url=bullx_url),
+            ],
+            [
+                InlineKeyboardButton(f"ðº Axiom: #{ticker}",   url=axiom_url),
+                InlineKeyboardButton(f"ð£ Pump: #{ticker}",    url=pump_url),
+            ],
+        ])
 
         try:
             await self.app.bot.send_message(
                 chat_id=chat_id,
-                text=message,
-                parse_mode="Markdown"
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=keyboard
             )
-            logger.info(f"Alert sent to chat {chat_id} for {ticker}")
+            logger.info(f"Alert sent â chat {chat_id} | {ticker}")
         except Exception as e:
-            logger.error(f"Failed to send alert to {chat_id}: {e}")
+            logger.error(f"Alert failed â chat {chat_id}: {e}")
