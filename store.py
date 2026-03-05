@@ -31,8 +31,12 @@ class DataStore:
         if key not in self.data["chats"]:
             self.data["chats"][key] = {
                 "wallets": {},
-                "threshold": 2
+                "threshold": 2,
+                "eco_mode": False   # Credit efficient mode — off by default
             }
+        # Migrate old chats that don't have eco_mode key
+        if "eco_mode" not in self.data["chats"][key]:
+            self.data["chats"][key]["eco_mode"] = False
 
     # ── WALLETS (scoped to chat_id) ──────────────
 
@@ -72,6 +76,48 @@ class DataStore:
     def set_threshold(self, chat_id: int, value: int):
         self._init_chat(chat_id)
         self.data["chats"][str(chat_id)]["threshold"] = value
+        self.save()
+
+    # ── ECO MODE (per chat) ──────────────────────
+
+    def get_eco_mode(self, chat_id: int) -> bool:
+        self._init_chat(chat_id)
+        return self.data["chats"][str(chat_id)].get("eco_mode", False)
+
+    def set_eco_mode(self, chat_id: int, enabled: bool):
+        self._init_chat(chat_id)
+        self.data["chats"][str(chat_id)]["eco_mode"] = enabled
+        self.save()
+
+    def any_eco_mode(self) -> bool:
+        """True if ANY chat has eco mode on — tracker uses lowest poll interval."""
+        for chat_data in self.data["chats"].values():
+            if chat_data.get("eco_mode", False):
+                return True
+        return False
+
+    def all_eco_mode(self) -> bool:
+        """True if ALL chats have eco mode on."""
+        chats = list(self.data["chats"].values())
+        if not chats:
+            return False
+        return all(c.get("eco_mode", False) for c in chats)
+
+    # ── CREDIT TRACKING ──────────────────────────
+
+    def add_credits_used(self, amount: int):
+        if "credits_used" not in self.data:
+            self.data["credits_used"] = 0
+        self.data["credits_used"] += amount
+        # Save periodically (every 100 credits to avoid too many writes)
+        if self.data["credits_used"] % 100 < amount:
+            self.save()
+
+    def get_credits_used(self) -> int:
+        return self.data.get("credits_used", 0)
+
+    def reset_credits(self):
+        self.data["credits_used"] = 0
         self.save()
 
     # ── GLOBAL HELPERS for tracker ───────────────
