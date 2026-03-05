@@ -14,14 +14,14 @@ logger = logging.getLogger(__name__)
 
 class WalletTracker:
     def __init__(self, app):
-        self.app         = app
-        self.store       = DataStore()
-        self.helius      = HeliusClient()
-        self.running     = False
+        self.app             = app
+        self.store           = DataStore()
+        self.helius          = HeliusClient()
+        self.running         = False
         self.last_signatures = {}
-        self.token_buys  = defaultdict(dict)   # token_mint -> {wallet: {sig, ts, sol_spent}}
-        self.time_window = timedelta(minutes=10)
-        self.sent_alerts = defaultdict(set)
+        self.token_buys      = defaultdict(dict)
+        self.time_window     = timedelta(minutes=10)
+        self.sent_alerts     = defaultdict(set)
 
     def _get_poll_interval(self):
         return ECO_POLL_INTERVAL if self.store.any_eco_mode() else NORMAL_POLL_INTERVAL
@@ -47,8 +47,10 @@ class WalletTracker:
             return
         for i in range(0, len(addresses), 10):
             batch = addresses[i:i+10]
-            await asyncio.gather(*[self.process_wallet(a, self._get_tx_limit()) for a in batch],
-                                  return_exceptions=True)
+            await asyncio.gather(
+                *[self.process_wallet(a, self._get_tx_limit()) for a in batch],
+                return_exceptions=True
+            )
             await asyncio.sleep(1)
         await self.check_alerts()
 
@@ -60,18 +62,18 @@ class WalletTracker:
             self.store.add_credits_used(1)
             seen = self.last_signatures.get(wallet_address, set())
             for tx in txs:
-                sig  = tx.get("signature", "")
+                sig = tx.get("signature", "")
                 if sig in seen:
                     continue
                 swap = self.helius.parse_swap_transaction(tx)
                 if not swap:
                     continue
                 mint = swap["token_mint"]
-                logger.info(f"[BUY] {wallet_address[:8]}... â {mint[:8]}...")
+                logger.info(f"[BUY] {wallet_address[:8]}... -> {mint[:8]}...")
                 self.token_buys[mint][wallet_address] = {
-                    "signature": sig,
-                    "timestamp": swap["timestamp"],
-                    "sol_spent": swap.get("sol_spent", 0),
+                    "signature":      sig,
+                    "timestamp":      swap["timestamp"],
+                    "sol_spent":      swap.get("sol_spent", 0),
                     "wallet_address": wallet_address
                 }
                 seen.add(sig)
@@ -106,14 +108,12 @@ class WalletTracker:
         market_data = await self.helius.get_market_cap(token_mint)
 
         ticker     = market_data.get("ticker", "???")
-        token_name = market_data.get("name", "Unknown")
         market_cap = market_data.get("market_cap", 0)
         price      = market_data.get("price_usd", "0")
         dex        = market_data.get("dex", "").lower()
-        pair_addr  = market_data.get("pair_address", "")
 
         def fmt_mc(mc):
-            if not mc: return "â"
+            if not mc: return "-"
             mc = float(mc)
             if mc >= 1_000_000: return f"${mc/1_000_000:.2f}M"
             if mc >= 1_000:     return f"${mc/1_000:.1f}K"
@@ -122,47 +122,41 @@ class WalletTracker:
         def fmt_sol(lamports):
             if not lamports: return ""
             sol = lamports / 1e9
-            if sol > 0.001: return f" ({sol:.2f} SOL)"
-            return ""
+            return f" ({sol:.2f} SOL)" if sol > 0.001 else ""
 
-        # How many seconds ago was the first buy
-        timestamps  = [info["timestamp"] for info in buyers.values()]
-        earliest    = min(timestamps)
-        seen_secs   = int(datetime.utcnow().timestamp() - earliest)
-        seen_str    = f"{seen_secs}s" if seen_secs < 60 else f"{seen_secs//60}m{seen_secs%60}s"
+        timestamps = [info["timestamp"] for info in buyers.values()]
+        earliest   = min(timestamps)
+        seen_secs  = int(datetime.utcnow().timestamp() - earliest)
+        seen_str   = f"{seen_secs}s" if seen_secs < 60 else f"{seen_secs//60}m{seen_secs%60}s"
 
-        # Build wallet lines â Name swapped X SOL for Y TOKEN
+        dex_label = {
+            "raydium":  "Raydium",
+            "jupiter":  "Jupiter",
+            "orca":     "Orca",
+            "pumpfun":  "Pump.fun",
+            "pump-fun": "Pump.fun",
+        }.get(dex, dex.upper() if dex else "Solana DEX")
+
         wallet_lines = []
         for addr, info in buyers.items():
             name     = chat_wallets.get(addr, {}).get("name", addr[:8] + "...")
             sol_note = fmt_sol(info.get("sol_spent", 0))
-            wallet_lines.append(f"ð *{name}*{sol_note}")
+            wallet_lines.append(f"\U0001f48e *{name}*{sol_note}")
 
-        # Dex label
-        dex_label = {
-            "raydium":    "Raydium",
-            "jupiter":    "Jupiter",
-            "orca":       "Orca",
-            "pumpfun":    "Pump.fun",
-            "pump-fun":   "Pump.fun",
-        }.get(dex, dex.upper() if dex else "Solana DEX")
+        eco_tag = "  \U0001f33f" if self.store.any_eco_mode() else ""
 
-        eco_tag = "  ð" if self.store.any_eco_mode() else ""
-
-        # ââ Alert message â Ray Gold style ââ
         text = (
-            f"ð¨  *{len(buyers)} WALLETS BOUGHT*{eco_tag}\n"
+            f"\U0001f6a8  *{len(buyers)} WALLETS BOUGHT*{eco_tag}\n"
             f"\n"
-            + "\n".join(wallet_lines) +
-            f"\n\n"
-            f"ð  *#{ticker}*  |  MC: *{fmt_mc(market_cap)}*  |  Seen: *{seen_str}*\n"
+            + "\n".join(wallet_lines)
+            + f"\n\n"
+            f"\U0001f4a0  *#{ticker}*  |  MC: *{fmt_mc(market_cap)}*  |  Seen: *{seen_str}*\n"
             f"`{token_mint}`\n"
             f"\n"
-            f"ðµ Price  *${price}*\n"
-            f"ð¦ DEX    *{dex_label}*"
+            f"\U0001f4b5 Price  *${price}*\n"
+            f"\U0001f3e6 DEX    *{dex_label}*"
         )
 
-        # ââ Quick-buy buttons â links to trading bots ââ
         trojan_url = f"https://t.me/solana_trojanbot?start=r-buy_{token_mint}"
         gmgn_url   = f"https://gmgn.ai/sol/token/{token_mint}"
         ds_url     = f"https://dexscreener.com/solana/{token_mint}"
@@ -172,16 +166,16 @@ class WalletTracker:
 
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton(f"ð´ Trojan: #{ticker}",  url=trojan_url),
-                InlineKeyboardButton(f"ð¦ GMGN: #{ticker}",    url=gmgn_url),
+                InlineKeyboardButton(f"\U0001f434 Trojan: #{ticker}", url=trojan_url),
+                InlineKeyboardButton(f"\U0001f98e GMGN: #{ticker}",   url=gmgn_url),
             ],
             [
-                InlineKeyboardButton(f"ð Chart",              url=ds_url),
-                InlineKeyboardButton(f"â¡ BullX: #{ticker}",   url=bullx_url),
+                InlineKeyboardButton(f"\U0001f4ca Chart",             url=ds_url),
+                InlineKeyboardButton(f"\u26a1 BullX: #{ticker}",      url=bullx_url),
             ],
             [
-                InlineKeyboardButton(f"ðº Axiom: #{ticker}",   url=axiom_url),
-                InlineKeyboardButton(f"ð£ Pump: #{ticker}",    url=pump_url),
+                InlineKeyboardButton(f"\U0001f53a Axiom: #{ticker}",  url=axiom_url),
+                InlineKeyboardButton(f"\U0001f7e3 Pump: #{ticker}",   url=pump_url),
             ],
         ])
 
@@ -192,6 +186,6 @@ class WalletTracker:
                 parse_mode="Markdown",
                 reply_markup=keyboard
             )
-            logger.info(f"Alert sent â chat {chat_id} | {ticker}")
+            logger.info(f"Alert sent -> chat {chat_id} | {ticker}")
         except Exception as e:
-            logger.error(f"Alert failed â chat {chat_id}: {e}")
+            logger.error(f"Alert failed -> chat {chat_id}: {e}")
