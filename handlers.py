@@ -1,249 +1,409 @@
 import logging
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
 from store import DataStore
 from config import MAX_WALLETS
 
 logger = logging.getLogger(__name__)
-store = DataStore()
+store  = DataStore()
 
 WAITING_FOR_ADDRESS = 1
-WAITING_FOR_NAME = 2
+WAITING_FOR_NAME    = 2
 
-def get_chat_id(update: Update) -> int:
-    return update.effective_chat.id
+def cid(u): return u.effective_chat.id
+
+# ── KEYBOARDS ─────────────────────────────────────────────────────────────────
+
+def main_menu_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Wallet",     callback_data="menu_add"),
+         InlineKeyboardButton("🗑 Remove Wallet",  callback_data="menu_remove")],
+        [InlineKeyboardButton("📋 My Wallets",     callback_data="menu_list"),
+         InlineKeyboardButton("📡 Status",         callback_data="menu_status")],
+        [InlineKeyboardButton("🎯 Set Threshold",  callback_data="menu_threshold"),
+         InlineKeyboardButton("🍃 Eco Mode",       callback_data="menu_ecomode")],
+        [InlineKeyboardButton("📈 Credits",        callback_data="menu_credits")],
+    ])
+
+def back_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("‹ Main Menu", callback_data="menu_main")]
+    ])
+
+def wallets_kb(wallets: dict):
+    buttons = []
+    for i, (addr, info) in enumerate(wallets.items()):
+        name = info.get("name", "Unnamed")
+        buttons.append([
+            InlineKeyboardButton(f"✅ {name}", callback_data=f"noop"),
+            InlineKeyboardButton("✕", callback_data=f"rm_{addr}")
+        ])
+    buttons.append([InlineKeyboardButton("‹ Main Menu", callback_data="menu_main")])
+    return InlineKeyboardMarkup(buttons)
+
+# ── START ─────────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = get_chat_id(update)
-    chat_type = update.effective_chat.type
+    chat_type  = update.effective_chat.type
+    wallet_cnt = store.get_wallet_count(cid(update))
+    threshold  = store.get_threshold(cid(update))
+    eco        = store.get_eco_mode(cid(update))
 
-    if chat_type == "private":
-        context_label = "your personal DMs"
-    else:
-        context_label = f"this group"
+    scope = "👤 Private" if chat_type == "private" else "👥 Group"
+    ready = wallet_cnt >= 2
 
-    msg = (
-        f"👁 *Solana Multi-Wallet Buy Tracker*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Wallets added here are *only visible to {context_label}*.\n"
-        f"Each chat has its own completely separate wallet list.\n\n"
-        f"Tap / to see all commands.\n\n"
-        f"Add at least *70 wallets* to start tracking."
+    text = (
+        f"👁  *WALLET TRACKER*\n"
+        f"\n"
+        f"Multi-wallet buy signal detector for Solana.\n"
+        f"Get alerted when {threshold}+ tracked wallets buy the same token.\n"
+        f"\n"
+        f"{'⚡  Full Mode' if not eco else '🍃  Eco Mode'}   ·   "
+        f"{scope}   ·   "
+        f"{'🟢 Active' if ready else '🔴 Need wallets'}\n"
+        f"·  *{wallet_cnt}* wallets tracked   ·   threshold *{threshold}*"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
 
-# ── ADD WALLET — Conversational flow ────────────
+    if update.message:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_kb())
+    else:
+        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_kb())
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
+# ── CALLBACK ROUTER ───────────────────────────────────────────────────────────
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q    = update.callback_query
+    data = q.data
+    await q.answer()
+
+    if data == "menu_main":
+        await start(update, context)
+
+    elif data == "menu_add":
+        await q.edit_message_text(
+            "➕  *ADD WALLET*\n\nPaste the Solana wallet address:",
+            parse_mode="Markdown", reply_markup=back_kb()
+        )
+        context.user_data["waiting"] = "add_address"
+
+    elif data == "menu_remove":
+        wallets = store.get_wallets(cid(update))
+        if not wallets:
+            await q.edit_message_text(
+                "📭  No wallets to remove.",
+                reply_markup=back_kb()
+            )
+        else:
+            await q.edit_message_text(
+                f"🗑  *REMOVE WALLET*\n\nTap ✕ next to the wallet to remove:",
+                parse_mode="Markdown", reply_markup=wallets_kb(wallets)
+            )
+
+    elif data.startswith("rm_"):
+        address = data[3:]
+        wallets = store.get_wallets(cid(update))
+        name    = wallets.get(address, {}).get("name", address[:8] + "...")
+        store.remove_wallet(cid(update), address)
+        remaining = store.get_wallets(cid(update))
+        if remaining:
+            await q.edit_message_text(
+                f"✅  *{name}* removed.\n\nTap ✕ to remove another:",
+                parse_mode="Markdown", reply_markup=wallets_kb(remaining)
+            )
+        else:
+            await q.edit_message_text(
+                f"✅  *{name}* removed.\n\nNo more wallets.",
+                parse_mode="Markdown", reply_markup=back_kb()
+            )
+
+    elif data == "menu_list":
+        await show_wallets(update, context)
+
+    elif data == "menu_status":
+        await show_status(update, context)
+
+    elif data == "menu_threshold":
+        threshold = store.get_threshold(cid(update))
+        await q.edit_message_text(
+            f"🎯  *SET THRESHOLD*\n\n"
+            f"Current threshold: *{threshold}* wallets\n\n"
+            f"This is how many tracked wallets must buy the same\n"
+            f"token within 10 minutes to trigger an alert.\n\n"
+            f"Type a number to change it:",
+            parse_mode="Markdown", reply_markup=back_kb()
+        )
+        context.user_data["waiting"] = "threshold"
+
+    elif data == "menu_ecomode":
+        await toggle_ecomode(update, context)
+
+    elif data == "menu_credits":
+        await show_credits(update, context)
+
+    elif data == "noop":
+        pass  # wallet name button — no action
+
+# ── MESSAGE ROUTER ────────────────────────────────────────────────────────────
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    waiting = context.user_data.get("waiting")
+    if not waiting:
+        await update.message.reply_text("Use the menu 👇", reply_markup=main_menu_kb())
+        return
+
+    text = update.message.text.strip()
+
+    if waiting == "add_address":
+        if len(text) < 32 or len(text) > 44 or " " in text:
+            await update.message.reply_text(
+                "❌  Invalid address — must be 32-44 chars.\nTry again:",
+                reply_markup=back_kb()
+            )
+            return
+        if store.wallet_exists(cid(update), text):
+            name = store.get_wallets(cid(update)).get(text, {}).get("name", "?")
+            await update.message.reply_text(
+                f"⚠️  Already tracking this wallet as *{name}*.\nSend a different address:",
+                parse_mode="Markdown", reply_markup=back_kb()
+            )
+            return
+        if store.get_wallet_count(cid(update)) >= MAX_WALLETS:
+            await update.message.reply_text(
+                f"❌  Wallet limit ({MAX_WALLETS}) reached.",
+                reply_markup=main_menu_kb()
+            )
+            context.user_data.clear()
+            return
+        context.user_data["pending_address"] = text
+        context.user_data["waiting"] = "add_name"
+        await update.message.reply_text(
+            f"✅  *Address saved*\n`{text}`\n\nNow give it a name:\n_e.g. Whale1, Alpha KOL, Bruski_",
+            parse_mode="Markdown", reply_markup=back_kb()
+        )
+
+    elif waiting == "add_name":
+        if len(text) > 30:
+            await update.message.reply_text("❌  Name too long (max 30 chars). Try again:")
+            return
+        address = context.user_data.get("pending_address")
+        if not address:
+            await update.message.reply_text("❌  Session expired. Start over.", reply_markup=main_menu_kb())
+            context.user_data.clear()
+            return
+        store.add_wallet(cid(update), address, text)
+        count = store.get_wallet_count(cid(update))
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅  *{text}* added!\n`{address}`\n\n·  Total wallets: *{count}*",
+            parse_mode="Markdown", reply_markup=main_menu_kb()
+        )
+
+    elif waiting == "threshold":
+        try:
+            val = int(text)
+            if val < 2:
+                await update.message.reply_text("❌  Minimum is 2. Try again:")
+                return
+            count = store.get_wallet_count(cid(update))
+            if val > count:
+                await update.message.reply_text(
+                    f"⚠️  You only have {count} wallets — threshold can't exceed that. Try again:"
+                )
+                return
+            store.set_threshold(cid(update), val)
+            context.user_data.clear()
+            await update.message.reply_text(
+                f"✅  Threshold set to *{val}* wallets.",
+                parse_mode="Markdown", reply_markup=main_menu_kb()
+            )
+        except ValueError:
+            await update.message.reply_text("❌  Enter a number. Try again:")
+
+# ── MENU SCREENS ──────────────────────────────────────────────────────────────
+
+async def show_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q       = update.callback_query
+    wallets = store.get_wallets(cid(update))
+    if not wallets:
+        await q.edit_message_text(
+            "📭  *MY WALLETS*\n\nNo wallets tracked yet.\nTap ➕ Add Wallet to get started.",
+            parse_mode="Markdown", reply_markup=back_kb()
+        )
+        return
+    count = len(wallets)
+    lines = [f"📋  *MY WALLETS  ·  {count} tracked*\n"]
+    for i, (addr, info) in enumerate(wallets.items(), 1):
+        name = info.get("name", "Unnamed")
+        lines.append(f"*{i}.*  {name}\n     `{addr[:20]}...`")
+    await q.edit_message_text(
+        "\n".join(lines),
+        parse_mode="Markdown", reply_markup=back_kb()
+    )
+
+async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q          = update.callback_query
+    chat_type  = update.effective_chat.type
+    wallet_cnt = store.get_wallet_count(cid(update))
+    threshold  = store.get_threshold(cid(update))
+    eco        = store.get_eco_mode(cid(update))
+    tracker    = q.bot_data.get("tracker") if hasattr(q, "bot_data") else None
+    running    = True  # tracker is always running if bot is up
+
+    scope = "👤 Private DM" if chat_type == "private" else "👥 Group"
+    ready = wallet_cnt >= 2
+
+    text = (
+        f"📡  *TRACKER STATUS*\n\n"
+        f"·  Context       {scope}\n"
+        f"·  Running       {'🟢 Yes' if running else '🔴 No'}\n"
+        f"·  Wallets       *{wallet_cnt}*\n"
+        f"·  Threshold     *{threshold}* wallets\n"
+        f"·  Mode          {'🍃 Eco' if eco else '⚡ Full'}\n"
+        f"·  Poll rate     {'60s' if eco else '10s'}\n"
+        f"·  Ready         {'✅ Alerts active' if ready else '❌ Add more wallets'}"
+    )
+    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=back_kb())
+
+async def toggle_ecomode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q   = update.callback_query
+    new = not store.get_eco_mode(cid(update))
+    store.set_eco_mode(cid(update), new)
+    if new:
+        text = (
+            "🍃  *ECO MODE  ON*\n\n"
+            "Credit usage reduced ~80%.\n\n"
+            "·  Poll rate     *60s*\n"
+            "·  Txns fetched  *5 per wallet*\n\n"
+            "_Alerts may be up to 60s slower. Best when not actively trading._"
+        )
+    else:
+        text = (
+            "⚡  *FULL MODE  ON*\n\n"
+            "Maximum speed restored.\n\n"
+            "·  Poll rate     *10s*\n"
+            "·  Txns fetched  *10 per wallet*"
+        )
+    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=back_kb())
+
+async def show_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q          = update.callback_query
+    used       = store.get_credits_used()
+    limit      = 100_000
+    rem        = max(0, limit - used)
+    pct        = round((used / limit) * 100, 1)
+    eco        = store.get_eco_mode(cid(update))
+    wallet_cnt = store.get_wallet_count(cid(update))
+    filled     = round(pct / 10)
+    bar        = "▰" * filled + "▱" * (10 - filled)
+    daily_est  = wallet_cnt * (1440 if eco else 8640)
+    days_left  = round(rem / daily_est) if daily_est > 0 else 999
+    text = (
+        f"📈  *HELIUS CREDITS*\n\n"
+        f"{bar}  {pct}%\n\n"
+        f"·  Used         *{used:,}*\n"
+        f"·  Remaining    *{rem:,}*\n"
+        f"·  Monthly cap  *{limit:,}*\n"
+        f"·  Est. days    *~{days_left}d*\n\n"
+        f"{'🍃  Eco mode ON' if eco else '⚡  Full mode ON'}\n\n"
+        f"_/resetcredits to reset on month start_"
+    )
+    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=back_kb())
+
+# ── LEGACY COMMANDS (still work if typed) ────────────────────────────────────
 
 async def add_wallet_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["waiting"] = "add_address"
     await update.message.reply_text(
-        "👛 *Add a Wallet — Step 1 of 2*\n\n"
-        "Send me the *Solana wallet address* you want to track:",
-        parse_mode="Markdown"
+        "➕  *ADD WALLET*\n\nPaste the Solana wallet address:",
+        parse_mode="Markdown", reply_markup=back_kb()
     )
     return WAITING_FOR_ADDRESS
 
 async def add_wallet_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = get_chat_id(update)
-    address = update.message.text.strip()
-
-    if len(address) < 32 or len(address) > 44:
-        await update.message.reply_text(
-            "❌ That doesn't look like a valid Solana address (32-44 characters).\n\n"
-            "Try again or type /cancel."
-        )
-        return WAITING_FOR_ADDRESS
-
-    if store.wallet_exists(chat_id, address):
-        existing = store.get_wallets(chat_id).get(address, {})
-        name = existing.get("name", "Unknown")
-        await update.message.reply_text(
-            f"⚠️ Already tracking this wallet as *{name}* in this chat.\n\n"
-            "Send a different address or type /cancel.",
-            parse_mode="Markdown"
-        )
-        return WAITING_FOR_ADDRESS
-
-    if store.get_wallet_count(chat_id) >= MAX_WALLETS:
-        await update.message.reply_text(f"❌ Maximum wallet limit ({MAX_WALLETS}) reached for this chat.")
-        return ConversationHandler.END
-
-    context.user_data["pending_address"] = address
-
-    await update.message.reply_text(
-        f"✅ *Address received!*\n`{address}`\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"*Step 2 of 2* — Give this wallet a name:\n\n"
-        f"Examples: _Whale1_, _Alpha Caller_, _KOL 5_",
-        parse_mode="Markdown"
-    )
-    return WAITING_FOR_NAME
+    await message_handler(update, context)
+    if context.user_data.get("waiting") == "add_name":
+        return WAITING_FOR_NAME
+    return ConversationHandler.END
 
 async def add_wallet_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = get_chat_id(update)
-    name = update.message.text.strip()
-    address = context.user_data.get("pending_address")
-
-    if not address:
-        await update.message.reply_text("❌ Something went wrong. Type /addwallet and try again.")
-        return ConversationHandler.END
-
-    if len(name) > 30:
-        await update.message.reply_text("❌ Name too long. Keep it under 30 characters:")
-        return WAITING_FOR_NAME
-
-    store.add_wallet(chat_id, address, name)
-    new_count = store.get_wallet_count(chat_id)
-    context.user_data.clear()
-
-    msg = (
-        f"🎉 *Wallet added!*\n\n"
-        f"👛 Name: *{name}*\n"
-        f"📋 Address: `{address}`\n\n"
-        f"📊 Wallets in this chat: *{new_count}*"
-    )
-    if new_count < 70:
-        msg += f"\n⚠️ Need *{70 - new_count}* more to reach minimum (70)."
-    else:
-        msg += f"\n✅ Tracking {new_count} wallets — alerts active!"
-
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await message_handler(update, context)
     return ConversationHandler.END
 
 async def add_wallet_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("❌ Cancelled.")
+    await update.message.reply_text("Cancelled.", reply_markup=main_menu_kb())
     return ConversationHandler.END
 
-# ── OTHER COMMANDS ───────────────────────────────
-
 async def remove_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = get_chat_id(update)
-
     if not context.args:
-        await update.message.reply_text(
-            "❌ Usage: `/removewallet <address>`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("❌  Usage: `/removewallet <address>`", parse_mode="Markdown")
         return
-
     address = context.args[0].strip()
-    wallets = store.get_wallets(chat_id)
-    name = wallets.get(address, {}).get("name", address[:8] + "...")
-
-    if store.remove_wallet(chat_id, address):
-        await update.message.reply_text(
-            f"🗑 Removed *{name}*\n"
-            f"📊 Wallets in this chat: *{store.get_wallet_count(chat_id)}*",
-            parse_mode="Markdown"
-        )
+    wallets = store.get_wallets(cid(update))
+    name    = wallets.get(address, {}).get("name", address[:8] + "...")
+    if store.remove_wallet(cid(update), address):
+        await update.message.reply_text(f"✅  *{name}* removed.", parse_mode="Markdown", reply_markup=main_menu_kb())
     else:
-        await update.message.reply_text("❌ Wallet not found in this chat.")
+        await update.message.reply_text("❌  Wallet not found.", reply_markup=main_menu_kb())
 
 async def list_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = get_chat_id(update)
-    wallets = store.get_wallets(chat_id)
-
+    wallets = store.get_wallets(cid(update))
     if not wallets:
-        await update.message.reply_text(
-            "📭 No wallets tracked in this chat yet.\n"
-            "Use /addwallet to add one."
-        )
+        await update.message.reply_text("📭  No wallets tracked yet.", reply_markup=main_menu_kb())
         return
-
-    count = len(wallets)
-    lines = [f"👛 *Wallets in this chat ({count}):*\n"]
+    lines = [f"📋  *MY WALLETS  ·  {len(wallets)} tracked*\n"]
     for i, (addr, info) in enumerate(wallets.items(), 1):
-        name = info.get("name", "Unnamed")
-        lines.append(f"{i}. *{name}*\n   `{addr}`")
-
-    full_msg = "\n".join(lines)
-    if len(full_msg) > 4000:
-        chunks = []
-        chunk = lines[0]
-        for line in lines[1:]:
-            if len(chunk) + len(line) > 3800:
-                chunks.append(chunk)
-                chunk = line
-            else:
-                chunk += "\n" + line
-        chunks.append(chunk)
-        for c in chunks:
-            await update.message.reply_text(c, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(full_msg, parse_mode="Markdown")
+        lines.append(f"*{i}.*  {info.get('name','Unnamed')}\n     `{addr}`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=main_menu_kb())
 
 async def set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = get_chat_id(update)
-
     if not context.args:
-        current = store.get_threshold(chat_id)
-        await update.message.reply_text(
-            f"📊 Current threshold: *{current}* wallets\n"
-            "Use `/threshold <number>` to change.\n"
-            "Example: `/threshold 3`",
-            parse_mode="Markdown"
-        )
+        t = store.get_threshold(cid(update))
+        await update.message.reply_text(f"🎯  Threshold: *{t}* wallets\n\n`/threshold <number>` to change.", parse_mode="Markdown")
         return
-
     try:
-        value = int(context.args[0])
-        if value < 2:
-            await update.message.reply_text("❌ Threshold must be at least 2.")
-            return
-        count = store.get_wallet_count(chat_id)
-        if value > count:
-            await update.message.reply_text(
-                f"⚠️ Threshold ({value}) is higher than your wallet count ({count}).\n"
-                "You'd never get alerts. Use a lower number."
-            )
-            return
-        store.set_threshold(chat_id, value)
-        await update.message.reply_text(
-            f"✅ Threshold set to *{value}* wallets for this chat.",
-            parse_mode="Markdown"
-        )
+        val = int(context.args[0])
+        store.set_threshold(cid(update), val)
+        await update.message.reply_text(f"✅  Threshold → *{val}*", parse_mode="Markdown", reply_markup=main_menu_kb())
     except ValueError:
-        await update.message.reply_text("❌ Enter a valid number. Example: `/threshold 3`", parse_mode="Markdown")
+        await update.message.reply_text("❌  Enter a number.")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = get_chat_id(update)
-    chat_type = update.effective_chat.type
-    tracker = context.bot_data.get('tracker')
-
-    wallet_count = store.get_wallet_count(chat_id)
-    threshold = store.get_threshold(chat_id)
-    is_running = tracker.running if tracker else False
-    is_ready = wallet_count >= 70
-
-    chat_label = "DM (private)" if chat_type == "private" else "Group chat"
-
-    msg = (
-        f"📡 *Tracker Status*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💬 Context: *{chat_label}*\n"
-        f"🔄 Running: {'✅ Yes' if is_running else '❌ No'}\n"
-        f"👛 Wallets in this chat: *{wallet_count}*\n"
-        f"🎯 Alert threshold: *{threshold}* wallets\n"
-        f"✅ Ready: {'Yes' if is_ready else f'No — need {70 - wallet_count} more'}\n\n"
-        f"_Wallets here are only visible to this chat._"
+    eco        = store.get_eco_mode(cid(update))
+    wallet_cnt = store.get_wallet_count(cid(update))
+    threshold  = store.get_threshold(cid(update))
+    await update.message.reply_text(
+        f"📡  *STATUS*\n\n"
+        f"·  Wallets    *{wallet_cnt}*\n"
+        f"·  Threshold  *{threshold}*\n"
+        f"·  Mode       {'🍃 Eco' if eco else '⚡ Full'}",
+        parse_mode="Markdown", reply_markup=main_menu_kb()
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "👁 *Solana Multi-Wallet Buy Tracker*\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "*Commands:*\n"
-        "/addwallet — Add a wallet to this chat\n"
-        "/removewallet — Remove a wallet from this chat\n"
-        "/wallets — List wallets tracked in this chat\n"
-        "/threshold — Set alert threshold for this chat\n"
-        "/status — Show status for this chat\n"
-        "/help — This message\n\n"
-        "🔒 Each chat has its own private wallet list.\n"
-        "Wallets added here never appear in other chats."
+async def ecomode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new = not store.get_eco_mode(cid(update))
+    store.set_eco_mode(cid(update), new)
+    await update.message.reply_text(
+        f"{'🍃 Eco Mode ON' if new else '⚡ Full Mode ON'}",
+        reply_markup=main_menu_kb()
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def credits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    used  = store.get_credits_used()
+    limit = 100_000
+    rem   = max(0, limit - used)
+    pct   = round((used / limit) * 100, 1)
+    await update.message.reply_text(
+        f"📈  *CREDITS*\n\n·  Used {used:,}  ·  Remaining {rem:,}  ·  {pct}%",
+        parse_mode="Markdown", reply_markup=main_menu_kb()
+    )
+
+async def resetcredits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store.reset_credits()
+    await update.message.reply_text("🔄  Credits reset.", reply_markup=main_menu_kb())
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Tap / to see all commands.")
+    await message_handler(update, context)
