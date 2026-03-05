@@ -18,6 +18,21 @@ POLL_INTERVAL = 10
 MAX_WALLETS = 200
 MIN_WALLETS_REQUIRED = 70
 
+# ── CREDIT EFFICIENT MODE ──────────────────────────
+# Normal mode:  poll every 10s, fetch 10 tx per wallet
+# Eco mode:     poll every 60s, fetch 5 tx per wallet
+# Saves ~80% of Helius credits used by the tracker
+
+NORMAL_POLL_INTERVAL = 10    # seconds between full polls
+ECO_POLL_INTERVAL    = 60    # seconds between polls in eco mode
+NORMAL_TX_FETCH      = 10    # transactions fetched per wallet per poll
+ECO_TX_FETCH         = 5     # transactions fetched per wallet in eco mode
+
+# Monthly credit estimates (rough)
+# Normal:  ~72K credits/day for 70 wallets → blows free tier in 1-2 days
+# Eco:     ~12K credits/day for 70 wallets → stays well within 100K/month
+MONTHLY_FREE_CREDITS = 100_000
+
 # Data persistence file
 DATA_FILE = "wallet_data.json"
 
