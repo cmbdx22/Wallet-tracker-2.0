@@ -3,12 +3,11 @@ import logging
 from telegram import BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, filters, ConversationHandler
+    CallbackQueryHandler, filters
 )
 from config import TELEGRAM_BOT_TOKEN
 from handlers import (
     start, help_command, button_handler, message_handler,
-    add_wallet_start, add_wallet_address, add_wallet_name, add_wallet_cancel,
     remove_wallet, list_wallets, set_threshold, status,
     ecomode_command, credits_command, resetcredits_command,
     WAITING_FOR_ADDRESS, WAITING_FOR_NAME
@@ -21,7 +20,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-async def set_bot_commands(app):
+tracker: WalletTracker = None
+
+async def post_init(app: Application):
+    """
+    Called by PTB after the app is fully initialised and the event loop
+    is running. This is the correct place to launch background tasks.
+    asyncio.create_task() in main() fires before the loop is ready
+    which silently swallows the task on some Python/PTB versions.
+    """
+    global tracker
+    logger.info("post_init: launching tracker background task...")
+    app.create_task(tracker.start_tracking())
+    logger.info("post_init: tracker task created.")
+
     await app.bot.set_my_commands([
         BotCommand("start",        "Open main menu"),
         BotCommand("threshold",    "Set alert threshold"),
@@ -29,12 +41,20 @@ async def set_bot_commands(app):
         BotCommand("cancel",       "Cancel current action"),
     ])
 
-async def main():
-    app     = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+def main():
+    global tracker
+
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)   # <-- runs AFTER loop is ready
+        .build()
+    )
+
     tracker = WalletTracker(app)
     app.bot_data["tracker"] = tracker
 
-    # Inline button handler
+    # Inline buttons
     app.add_handler(CallbackQueryHandler(button_handler))
 
     # Commands
@@ -48,25 +68,11 @@ async def main():
     app.add_handler(CommandHandler("credits",      credits_command))
     app.add_handler(CommandHandler("resetcredits", resetcredits_command))
 
-    # Plain text â routed by context.user_data["waiting"]
+    # Plain text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    await app.initialize()
-    await set_bot_commands(app)
-    await app.start()
-
-    asyncio.create_task(tracker.start_tracking())
-
-    logger.info("Wallet Tracker Bot started.")
-    await app.updater.start_polling(drop_pending_updates=True)
-
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await tracker.stop()
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+    logger.info("Starting Wallet Tracker Bot...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
