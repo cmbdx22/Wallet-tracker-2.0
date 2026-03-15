@@ -10,7 +10,6 @@ from handlers import (
     start, help_command, button_handler, message_handler,
     remove_wallet, list_wallets, set_threshold, status,
     ecomode_command, credits_command, resetcredits_command,
-    WAITING_FOR_ADDRESS, WAITING_FOR_NAME
 )
 from tracker import WalletTracker
 
@@ -20,37 +19,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-tracker: WalletTracker = None
 
-async def post_init(app: Application):
-    """
-    Called by PTB after the app is fully initialised and the event loop
-    is running. This is the correct place to launch background tasks.
-    asyncio.create_task() in main() fires before the loop is ready
-    which silently swallows the task on some Python/PTB versions.
-    """
-    global tracker
-    logger.info("post_init: launching tracker background task...")
-    app.create_task(tracker.start_tracking())
-    logger.info("post_init: tracker task created.")
-
-    await app.bot.set_my_commands([
-        BotCommand("start",        "Open main menu"),
-        BotCommand("threshold",    "Set alert threshold"),
-        BotCommand("resetcredits", "Reset monthly credit counter"),
-        BotCommand("cancel",       "Cancel current action"),
-    ])
-
-def main():
-    global tracker
-
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)   # <-- runs AFTER loop is ready
-        .build()
-    )
-
+async def main():
+    app     = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     tracker = WalletTracker(app)
     app.bot_data["tracker"] = tracker
 
@@ -67,12 +38,38 @@ def main():
     app.add_handler(CommandHandler("ecomode",      ecomode_command))
     app.add_handler(CommandHandler("credits",      credits_command))
     app.add_handler(CommandHandler("resetcredits", resetcredits_command))
-
-    # Plain text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    logger.info("Starting Wallet Tracker Bot...")
-    app.run_polling(drop_pending_updates=True)
+    await app.initialize()
+
+    await app.bot.set_my_commands([
+        BotCommand("start",        "Open main menu"),
+        BotCommand("threshold",    "Set alert threshold"),
+        BotCommand("resetcredits", "Reset monthly credit counter"),
+        BotCommand("cancel",       "Cancel current action"),
+    ])
+
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+
+    logger.info("Bot polling started â launching tracker...")
+
+    # PTB 20.x: use asyncio.create_task AFTER polling has started
+    # At this point the event loop is fully running
+    tracker_task = asyncio.ensure_future(tracker.start_tracking())
+
+    logger.info("Tracker task launched.")
+
+    try:
+        await asyncio.Event().wait()  # run forever
+    finally:
+        logger.info("Shutting down...")
+        tracker_task.cancel()
+        await tracker.stop()
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
